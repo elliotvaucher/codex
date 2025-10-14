@@ -12,6 +12,6 @@ expression: term.backend().vt100().screen().contents()
 • Investigating rendering code (0s • esc to interrupt)
 
 
-› Explain this case to me
+› Summarize recent commits
 
   100% context left
