@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Codex Electron POC</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        background-color: #111827;
+        color: #f9fafb;
+      }
+      header {
+        padding: 16px;
+        background: #1f2937;
+        border-bottom: 1px solid #374151;
+      }
+      main {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        padding: 16px;
+        flex: 1;
+        overflow: hidden;
+      }
+      section {
+        background: #1f2937;
+        border-radius: 8px;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.25rem;
+      }
+      h2 {
+        margin: 0 0 8px 0;
+        font-size: 1rem;
+        font-weight: 600;
+        color: #e5e7eb;
+      }
+      #controls {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      .session-settings {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 16px;
+      }
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 220px;
+      }
+      .field label {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #9ca3af;
+      }
+      .field-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      input,
+      select {
+        font-family: inherit;
+      }
+      button {
+        background: #2563eb;
+        border: none;
+        color: white;
+        padding: 8px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      select {
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid #374151;
+        background: #0f172a;
+        color: #f9fafb;
+      }
+      input {
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid #374151;
+        background: #0f172a;
+        color: #f9fafb;
+      }
+      input::placeholder {
+        color: #6b7280;
+      }
+      input:focus,
+      select:focus,
+      textarea:focus {
+        outline: 2px solid #3b82f6;
+        outline-offset: 2px;
+      }
+      #browse-cwd {
+        background: #374151;
+      }
+      textarea {
+        width: 100%;
+        min-height: 120px;
+        border-radius: 6px;
+        border: 1px solid #374151;
+        background: #111827;
+        color: #f9fafb;
+        padding: 8px;
+        resize: vertical;
+        font-family: inherit;
+      }
+      ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        overflow-y: auto;
+        flex: 1;
+        font-size: 0.875rem;
+      }
+      li + li {
+        margin-top: 6px;
+      }
+      code {
+        font-family: "Fira Code", "SFMono-Regular", Consolas, monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .status {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .status span {
+        font-size: 0.85rem;
+        color: #d1d5db;
+      }
+      #event-feed {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding-right: 4px;
+      }
+      #event-feed li {
+        background: #111b2c;
+        border: 1px solid #374151;
+        border-left: 3px solid #3b82f6;
+        border-radius: 8px;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-width: 92%;
+        align-self: flex-start;
+      }
+      #event-feed li + li {
+        margin-top: 0;
+      }
+      #event-feed li.event--agent {
+        border-left-color: #3b82f6;
+        background: #15203a;
+      }
+      #event-feed li.event--user {
+        border-left-color: #facc15;
+        background: #1e293b;
+        margin-left: auto;
+      }
+      #event-feed li.event--system {
+        border-left-color: #6b7280;
+        background: #131f33;
+      }
+      #event-feed li.event--tool {
+        border-left-color: #8b5cf6;
+        background: #1a1f3f;
+      }
+      #event-feed li.event--error {
+        border-left-color: #f87171;
+        background: #2b1520;
+      }
+      .event__header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        font-size: 0.7rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #9ca3af;
+      }
+      .event__meta {
+        color: #6b7280;
+        font-size: 0.65rem;
+      }
+      .event__body {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        color: #f9fafb;
+      }
+      .event__text,
+      .event__reasoning,
+      .event__note,
+      .event__detail,
+      .event__quote {
+        white-space: pre-wrap;
+        line-height: 1.45;
+      }
+      .event__text {
+        font-size: 0.95rem;
+      }
+      .event__reasoning {
+        font-style: italic;
+        color: #cbd5f5;
+      }
+      .event__details {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        color: #d1d5db;
+        font-size: 0.8rem;
+      }
+      .event__detail {
+        color: #d1d5db;
+      }
+      .event__note {
+        color: #d1d5db;
+        font-size: 0.85rem;
+      }
+      .event__note--error {
+        color: #fca5a5;
+      }
+      .event__outputs {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .event__code {
+        background: #0b1220;
+        border-radius: 6px;
+        padding: 8px;
+        font-family: "Fira Code", "SFMono-Regular", Consolas, monospace;
+        font-size: 0.8rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-x: auto;
+      }
+      .event__code--stdout {
+        color: #a5b4fc;
+      }
+      .event__code--stderr {
+        color: #fca5a5;
+      }
+      .event__code--diff {
+        color: #34d399;
+      }
+      .event__json {
+        background: #0f172a;
+        border-radius: 6px;
+        padding: 8px;
+        font-family: "Fira Code", "SFMono-Regular", Consolas, monospace;
+        font-size: 0.75rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border: 1px solid #1f2937;
+      }
+      .event__plan {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 0.85rem;
+        color: #e5e7eb;
+      }
+      .event__quote {
+        border-left: 3px solid #3b82f6;
+        padding-left: 10px;
+        color: #dbeafe;
+        font-size: 0.9rem;
+      }
+      .approvals {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 12px;
+        max-height: 200px;
+        overflow-y: auto;
+        padding-right: 4px;
+      }
+      .approval-card {
+        background: #111b2c;
+        border: 1px solid #374151;
+        border-radius: 8px;
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .approval-card__title {
+        font-size: 0.9rem;
+        font-weight: 600;
+        color: #e5e7eb;
+      }
+      .approval-card__command {
+        font-family: "Fira Code", "SFMono-Regular", Consolas, monospace;
+        font-size: 0.8rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .approval-card__meta {
+        font-size: 0.75rem;
+        color: #9ca3af;
+      }
+      .approval-card__actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .approval-card__actions button {
+        flex: 1 1 120px;
+      }
+      .approval-card__actions button[data-variant="approve"] {
+        background: #2563eb;
+      }
+      .approval-card__actions button[data-variant="session"] {
+        background: #7c3aed;
+      }
+      .approval-card__actions button[data-variant="deny"] {
+        background: #b91c1c;
+      }
+      .approval-card__actions button[data-variant="abort"] {
+        background: #6b7280;
+      }
+      .approvals__empty {
+        font-size: 0.8rem;
+        color: #9ca3af;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Codex Electron Proof of Concept</h1>
+      <div class="status">
+        <span id="status-line">Starting app server…</span>
+        <span id="conversation-id">Conversation: —</span>
+      </div>
+      <div id="controls">
+        <button id="start-conversation">Start Conversation</button>
+        <button id="send-message" disabled>Send Message</button>
+      </div>
+      <div class="session-settings">
+        <div class="field">
+          <label for="cwd-input">Working Directory</label>
+          <div class="field-row">
+            <input id="cwd-input" type="text" placeholder="Optional – defaults to app server cwd" />
+            <button id="browse-cwd" type="button">Browse…</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="sandbox-select">Sandbox</label>
+          <select id="sandbox-select">
+            <option value="read-only">Read only</option>
+            <option value="workspace-write">Workspace write</option>
+            <option value="danger-full-access">Danger full access</option>
+          </select>
+        </div>
+      </div>
+    </header>
+    <main>
+      <section>
+        <h2>Conversation</h2>
+        <ul id="event-feed"></ul>
+      </section>
+      <section>
+        <h2>Raw JSON</h2>
+        <ul id="log-feed"></ul>
+        <h2>Pending Approvals</h2>
+        <div id="approval-empty" class="approvals__empty">No pending approvals.</div>
+        <div id="approval-requests" class="approvals"></div>
+        <h2>User Message</h2>
+        <textarea id="user-input" placeholder="Type a prompt for Codex…"></textarea>
+      </section>
+    </main>
+    <script type="module" src="./renderer.js"></script>
+  </body>
+</html>

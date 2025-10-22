@@ -1,0 +1,22 @@
+{
+  "name": "@openai/codex-electron-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Proof-of-concept Electron UI that talks to the Codex app server.",
+  "type": "commonjs",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "pnpm run build && electron .",
+    "dev": "pnpm run build && electron --trace-warnings .",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "electron": "^31.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.6.3"
+  }
+}
