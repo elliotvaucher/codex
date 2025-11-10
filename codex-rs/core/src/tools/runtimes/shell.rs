@@ -4,15 +4,16 @@ Runtime: shell
 Executes shell requests under the orchestrator: asks for approval when needed,
 builds a CommandSpec, and runs it under the current SandboxAttempt.
 */
-use crate::command_safety::is_dangerous_command::command_might_be_dangerous;
-use crate::command_safety::is_safe_command::is_known_safe_command;
+use crate::command_safety::is_dangerous_command::requires_initial_appoval;
 use crate::exec::ExecToolCallOutput;
 use crate::protocol::SandboxPolicy;
 use crate::sandboxing::execute_env;
 use crate::tools::runtimes::build_command_spec;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
+use crate::tools::sandboxing::ProvidesSandboxRetryData;
 use crate::tools::sandboxing::SandboxAttempt;
+use crate::tools::sandboxing::SandboxRetryData;
 use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::SandboxablePreference;
 use crate::tools::sandboxing::ToolCtx;
@@ -32,6 +33,15 @@ pub struct ShellRequest {
     pub env: std::collections::HashMap<String, String>,
     pub with_escalated_permissions: Option<bool>,
     pub justification: Option<String>,
+}
+
+impl ProvidesSandboxRetryData for ShellRequest {
+    fn sandbox_retry_data(&self) -> Option<SandboxRetryData> {
+        Some(SandboxRetryData {
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -90,13 +100,14 @@ impl Approvable<ShellRequest> for ShellRuntime {
             .retry_reason
             .clone()
             .or_else(|| req.justification.clone());
+        let risk = ctx.risk.clone();
         let session = ctx.session;
         let turn = ctx.turn;
         let call_id = ctx.call_id.to_string();
         Box::pin(async move {
-            with_cached_approval(&session.services, key, || async move {
+            with_cached_approval(&session.services, key, move || async move {
                 session
-                    .request_command_approval(turn, call_id, command, cwd, reason)
+                    .request_command_approval(turn, call_id, command, cwd, reason, risk)
                     .await
             })
             .await
@@ -109,28 +120,12 @@ impl Approvable<ShellRequest> for ShellRuntime {
         policy: AskForApproval,
         sandbox_policy: &SandboxPolicy,
     ) -> bool {
-        if is_known_safe_command(&req.command) {
-            return false;
-        }
-        match policy {
-            AskForApproval::Never | AskForApproval::OnFailure => false,
-            AskForApproval::OnRequest => {
-                // In DangerFullAccess, only prompt if the command looks dangerous.
-                if matches!(sandbox_policy, SandboxPolicy::DangerFullAccess) {
-                    return command_might_be_dangerous(&req.command);
-                }
-
-                // In restricted sandboxes (ReadOnly/WorkspaceWrite), do not prompt for
-                // non‑escalated, non‑dangerous commands — let the sandbox enforce
-                // restrictions (e.g., block network/write) without a user prompt.
-                let wants_escalation = req.with_escalated_permissions.unwrap_or(false);
-                if wants_escalation {
-                    return true;
-                }
-                command_might_be_dangerous(&req.command)
-            }
-            AskForApproval::UnlessTrusted => !is_known_safe_command(&req.command),
-        }
+        requires_initial_appoval(
+            policy,
+            sandbox_policy,
+            &req.command,
+            req.with_escalated_permissions.unwrap_or(false),
+        )
     }
 
     fn wants_escalated_first_attempt(&self, req: &ShellRequest) -> bool {
