@@ -8,7 +8,9 @@ use codex_core::exec::ExecToolCallOutput;
 use codex_core::exec::SandboxType;
 use codex_core::exec::process_exec_tool_call;
 use codex_core::protocol::SandboxPolicy;
+use codex_core::sandboxing::SandboxPermissions;
 use codex_core::spawn::CODEX_SANDBOX_ENV_VAR;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use tempfile::TempDir;
 
 use codex_core::error::Result;
@@ -26,22 +28,25 @@ fn skip_test() -> bool {
 
 #[expect(clippy::expect_used)]
 async fn run_test_cmd(tmp: TempDir, cmd: Vec<&str>) -> Result<ExecToolCallOutput> {
-    let sandbox_type = get_platform_sandbox().expect("should be able to get sandbox type");
+    let sandbox_type = get_platform_sandbox(false).expect("should be able to get sandbox type");
     assert_eq!(sandbox_type, SandboxType::MacosSeatbelt);
 
     let params = ExecParams {
         command: cmd.iter().map(ToString::to_string).collect(),
         cwd: tmp.path().to_path_buf(),
-        timeout_ms: Some(1000),
+        expiration: 1000.into(),
         env: HashMap::new(),
-        with_escalated_permissions: None,
+        network: None,
+        network_attempt_id: None,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
         justification: None,
         arg0: None,
     };
 
     let policy = SandboxPolicy::new_read_only_policy();
 
-    process_exec_tool_call(params, sandbox_type, &policy, tmp.path(), &None, None).await
+    process_exec_tool_call(params, &policy, tmp.path(), &None, false, None).await
 }
 
 /// Command succeeds with exit code 0 normally

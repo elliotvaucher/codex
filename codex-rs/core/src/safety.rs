@@ -6,26 +6,11 @@ use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 
 use crate::exec::SandboxType;
+use crate::util::resolve_path;
 
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
-
-#[cfg(target_os = "windows")]
-use std::sync::atomic::AtomicBool;
-#[cfg(target_os = "windows")]
-use std::sync::atomic::Ordering;
-
-#[cfg(target_os = "windows")]
-static WINDOWS_SANDBOX_ENABLED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(target_os = "windows")]
-pub fn set_windows_sandbox_enabled(enabled: bool) {
-    WINDOWS_SANDBOX_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-pub fn set_windows_sandbox_enabled(_enabled: bool) {}
+use codex_protocol::config_types::WindowsSandboxLevel;
 
 #[derive(Debug, PartialEq)]
 pub enum SafetyCheck {
@@ -44,6 +29,7 @@ pub fn assess_patch_safety(
     policy: AskForApproval,
     sandbox_policy: &SandboxPolicy,
     cwd: &Path,
+    windows_sandbox_level: WindowsSandboxLevel,
 ) -> SafetyCheck {
     if action.is_empty() {
         return SafetyCheck::Reject {
@@ -68,7 +54,10 @@ pub fn assess_patch_safety(
     if is_write_patch_constrained_to_writable_paths(action, sandbox_policy, cwd)
         || policy == AskForApproval::OnFailure
     {
-        if matches!(sandbox_policy, SandboxPolicy::DangerFullAccess) {
+        if matches!(
+            sandbox_policy,
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
+        ) {
             // DangerFullAccess is intended to bypass sandboxing entirely.
             SafetyCheck::AutoApprove {
                 sandbox_type: SandboxType::None,
@@ -78,7 +67,7 @@ pub fn assess_patch_safety(
             // Only auto‑approve when we can actually enforce a sandbox. Otherwise
             // fall back to asking the user because the patch may touch arbitrary
             // paths outside the project.
-            match get_platform_sandbox() {
+            match get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled) {
                 Some(sandbox_type) => SafetyCheck::AutoApprove {
                     sandbox_type,
                     user_explicitly_approved: false,
@@ -96,19 +85,17 @@ pub fn assess_patch_safety(
     }
 }
 
-pub fn get_platform_sandbox() -> Option<SandboxType> {
+pub fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<SandboxType> {
     if cfg!(target_os = "macos") {
         Some(SandboxType::MacosSeatbelt)
     } else if cfg!(target_os = "linux") {
         Some(SandboxType::LinuxSeccomp)
     } else if cfg!(target_os = "windows") {
-        #[cfg(target_os = "windows")]
-        {
-            if WINDOWS_SANDBOX_ENABLED.load(Ordering::Relaxed) {
-                return Some(SandboxType::WindowsRestrictedToken);
-            }
+        if windows_sandbox_enabled {
+            Some(SandboxType::WindowsRestrictedToken)
+        } else {
+            None
         }
-        None
     } else {
         None
     }
@@ -121,10 +108,10 @@ fn is_write_patch_constrained_to_writable_paths(
 ) -> bool {
     // Early‑exit if there are no declared writable roots.
     let writable_roots = match sandbox_policy {
-        SandboxPolicy::ReadOnly => {
+        SandboxPolicy::ReadOnly { .. } => {
             return false;
         }
-        SandboxPolicy::DangerFullAccess => {
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
             return true;
         }
         SandboxPolicy::WorkspaceWrite { .. } => sandbox_policy.get_writable_roots_with_cwd(cwd),
@@ -150,11 +137,7 @@ fn is_write_patch_constrained_to_writable_paths(
     // and roots are converted to absolute, normalized forms before the
     // prefix check.
     let is_path_writable = |p: &PathBuf| {
-        let abs = if p.is_absolute() {
-            p.clone()
-        } else {
-            cwd.join(p)
-        };
+        let abs = resolve_path(cwd, p);
         let abs = match normalize(&abs) {
             Some(v) => v,
             None => return false,
@@ -191,6 +174,7 @@ fn is_write_patch_constrained_to_writable_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -211,6 +195,7 @@ mod tests {
         // only `cwd` is writable by default.
         let policy_workspace_only = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
+            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
@@ -231,7 +216,8 @@ mod tests {
         // With the parent dir explicitly added as a writable root, the
         // outside write should be permitted.
         let policy_with_parent = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![parent],
+            writable_roots: vec![AbsolutePathBuf::try_from(parent).unwrap()],
+            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
@@ -241,5 +227,30 @@ mod tests {
             &policy_with_parent,
             &cwd,
         ));
+    }
+
+    #[test]
+    fn external_sandbox_auto_approves_in_on_request() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let add_inside = ApplyPatchAction::new_add_for_test(&cwd.join("inner.txt"), "".to_string());
+
+        let policy = SandboxPolicy::ExternalSandbox {
+            network_access: codex_protocol::protocol::NetworkAccess::Enabled,
+        };
+
+        assert_eq!(
+            assess_patch_safety(
+                &add_inside,
+                AskForApproval::OnRequest,
+                &policy,
+                &cwd,
+                WindowsSandboxLevel::Disabled
+            ),
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::None,
+                user_explicitly_approved: false,
+            }
+        );
     }
 }

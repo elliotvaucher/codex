@@ -1,6 +1,9 @@
 use codex_core::AuthManager;
 use codex_core::config::Config;
-use codex_core::git_info::get_git_repo_root;
+#[cfg(target_os = "windows")]
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+#[cfg(target_os = "windows")]
+use codex_protocol::config_types::WindowsSandboxLevel;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -11,16 +14,15 @@ use ratatui::style::Color;
 use ratatui::widgets::Clear;
 use ratatui::widgets::WidgetRef;
 
-use codex_app_server_protocol::AuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 
 use crate::LoginStatus;
 use crate::onboarding::auth::AuthModeWidget;
+use crate::onboarding::auth::SignInOption;
 use crate::onboarding::auth::SignInState;
 use crate::onboarding::trust_directory::TrustDirectorySelection;
 use crate::onboarding::trust_directory::TrustDirectoryWidget;
 use crate::onboarding::welcome::WelcomeWidget;
-use crate::onboarding::windows::WindowsSetupWidget;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
@@ -30,7 +32,6 @@ use std::sync::RwLock;
 
 #[allow(clippy::large_enum_variant)]
 enum Step {
-    Windows(WindowsSetupWidget),
     Welcome(WelcomeWidget),
     Auth(AuthModeWidget),
     TrustDirectory(TrustDirectoryWidget),
@@ -56,11 +57,10 @@ pub(crate) struct OnboardingScreen {
     request_frame: FrameRequester,
     steps: Vec<Step>,
     is_done: bool,
-    windows_install_selected: bool,
+    should_exit: bool,
 }
 
 pub(crate) struct OnboardingScreenArgs {
-    pub show_windows_wsl_screen: bool,
     pub show_trust_screen: bool,
     pub show_login_screen: bool,
     pub login_status: LoginStatus,
@@ -70,13 +70,12 @@ pub(crate) struct OnboardingScreenArgs {
 
 pub(crate) struct OnboardingResult {
     pub directory_trust_decision: Option<TrustDirectorySelection>,
-    pub windows_install_selected: bool,
+    pub should_exit: bool,
 }
 
 impl OnboardingScreen {
     pub(crate) fn new(tui: &mut Tui, args: OnboardingScreenArgs) -> Self {
         let OnboardingScreenArgs {
-            show_windows_wsl_screen,
             show_trust_screen,
             show_login_screen,
             login_status,
@@ -86,20 +85,18 @@ impl OnboardingScreen {
         let cwd = config.cwd.clone();
         let forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
         let forced_login_method = config.forced_login_method;
-        let codex_home = config.codex_home;
+        let codex_home = config.codex_home.clone();
         let cli_auth_credentials_store_mode = config.cli_auth_credentials_store_mode;
         let mut steps: Vec<Step> = Vec::new();
-        if show_windows_wsl_screen {
-            steps.push(Step::Windows(WindowsSetupWidget::new(codex_home.clone())));
-        }
         steps.push(Step::Welcome(WelcomeWidget::new(
             !matches!(login_status, LoginStatus::NotAuthenticated),
             tui.frame_requester(),
+            config.animations,
         )));
         if show_login_screen {
             let highlighted_mode = match forced_login_method {
-                Some(ForcedLoginMethod::Api) => AuthMode::ApiKey,
-                _ => AuthMode::ChatGPT,
+                Some(ForcedLoginMethod::Api) => SignInOption::ApiKey,
+                _ => SignInOption::ChatGpt,
             };
             steps.push(Step::Auth(AuthModeWidget {
                 request_frame: tui.frame_requester(),
@@ -112,20 +109,21 @@ impl OnboardingScreen {
                 auth_manager,
                 forced_chatgpt_workspace_id,
                 forced_login_method,
+                animations_enabled: config.animations,
             }))
         }
-        let is_git_repo = get_git_repo_root(&cwd).is_some();
-        let highlighted = if is_git_repo {
-            TrustDirectorySelection::Trust
-        } else {
-            // Default to not trusting the directory if it's not a git repo.
-            TrustDirectorySelection::DontTrust
-        };
+        #[cfg(target_os = "windows")]
+        let show_windows_create_sandbox_hint =
+            WindowsSandboxLevel::from_config(&config) == WindowsSandboxLevel::Disabled;
+        #[cfg(not(target_os = "windows"))]
+        let show_windows_create_sandbox_hint = false;
+        let highlighted = TrustDirectorySelection::Trust;
         if show_trust_screen {
             steps.push(Step::TrustDirectory(TrustDirectoryWidget {
                 cwd,
                 codex_home,
-                is_git_repo,
+                show_windows_create_sandbox_hint,
+                should_quit: false,
                 selection: None,
                 highlighted,
                 error: None,
@@ -136,7 +134,7 @@ impl OnboardingScreen {
             request_frame: tui.frame_requester(),
             steps,
             is_done: false,
-            windows_install_selected: false,
+            should_exit: false,
         }
     }
 
@@ -197,14 +195,30 @@ impl OnboardingScreen {
             .flatten()
     }
 
-    pub fn windows_install_selected(&self) -> bool {
-        self.windows_install_selected
+    pub fn should_exit(&self) -> bool {
+        self.should_exit
+    }
+
+    fn is_api_key_entry_active(&self) -> bool {
+        self.steps.iter().any(|step| {
+            if let Step::Auth(widget) = step {
+                return widget
+                    .sign_in_state
+                    .read()
+                    .is_ok_and(|g| matches!(&*g, SignInState::ApiKeyEntry(_)));
+            }
+            false
+        })
     }
 }
 
 impl KeyboardHandler for OnboardingScreen {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event {
+        if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return;
+        }
+        let is_api_key_entry_active = self.is_api_key_entry_active();
+        let should_quit = match key_event {
             KeyEvent {
                 code: KeyCode::Char('d'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
@@ -216,36 +230,42 @@ impl KeyboardHandler for OnboardingScreen {
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
                 kind: KeyEventKind::Press,
                 ..
-            }
-            | KeyEvent {
+            } => true,
+            KeyEvent {
                 code: KeyCode::Char('q'),
                 kind: KeyEventKind::Press,
                 ..
-            } => {
-                if !self.is_auth_in_progress() {
-                    self.is_done = true;
-                }
-            }
-            _ => {
-                if let Some(Step::Welcome(widget)) = self
-                    .steps
-                    .iter_mut()
-                    .find(|step| matches!(step, Step::Welcome(_)))
-                {
-                    widget.handle_key_event(key_event);
-                }
-                if let Some(active_step) = self.current_steps_mut().into_iter().last() {
-                    active_step.handle_key_event(key_event);
-                }
-            }
+            } => !is_api_key_entry_active,
+            _ => false,
         };
-        if self
-            .steps
-            .iter()
-            .any(|step| matches!(step, Step::Windows(widget) if widget.exit_requested()))
-        {
-            self.windows_install_selected = true;
+        if should_quit {
+            if self.is_auth_in_progress() {
+                // If the user cancels the auth menu, exit the app rather than
+                // leave the user at a prompt in an unauthed state.
+                self.should_exit = true;
+            }
             self.is_done = true;
+        } else {
+            if let Some(Step::Welcome(widget)) = self
+                .steps
+                .iter_mut()
+                .find(|step| matches!(step, Step::Welcome(_)))
+            {
+                widget.handle_key_event(key_event);
+            }
+            if let Some(active_step) = self.current_steps_mut().into_iter().last() {
+                active_step.handle_key_event(key_event);
+            }
+            if self.steps.iter().any(|step| {
+                if let Step::TrustDirectory(widget) = step {
+                    widget.should_quit()
+                } else {
+                    false
+                }
+            }) {
+                self.should_exit = true;
+                self.is_done = true;
+            }
         }
         self.request_frame.schedule_frame();
     }
@@ -307,6 +327,9 @@ impl WidgetRef for &OnboardingScreen {
             }
             let scratch_area = Rect::new(0, 0, width, max_h);
             let mut scratch = Buffer::empty(scratch_area);
+            if let Step::Welcome(widget) = step {
+                widget.update_layout_area(scratch_area);
+            }
             step.render_ref(scratch_area, &mut scratch);
             let h = used_rows(&scratch, width, max_h).min(max_h);
             if h > 0 {
@@ -328,7 +351,6 @@ impl WidgetRef for &OnboardingScreen {
 impl KeyboardHandler for Step {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match self {
-            Step::Windows(widget) => widget.handle_key_event(key_event),
             Step::Welcome(widget) => widget.handle_key_event(key_event),
             Step::Auth(widget) => widget.handle_key_event(key_event),
             Step::TrustDirectory(widget) => widget.handle_key_event(key_event),
@@ -337,7 +359,6 @@ impl KeyboardHandler for Step {
 
     fn handle_paste(&mut self, pasted: String) {
         match self {
-            Step::Windows(_) => {}
             Step::Welcome(_) => {}
             Step::Auth(widget) => widget.handle_paste(pasted),
             Step::TrustDirectory(widget) => widget.handle_paste(pasted),
@@ -348,7 +369,6 @@ impl KeyboardHandler for Step {
 impl StepStateProvider for Step {
     fn get_step_state(&self) -> StepState {
         match self {
-            Step::Windows(w) => w.get_step_state(),
             Step::Welcome(w) => w.get_step_state(),
             Step::Auth(w) => w.get_step_state(),
             Step::TrustDirectory(w) => w.get_step_state(),
@@ -359,9 +379,6 @@ impl StepStateProvider for Step {
 impl WidgetRef for Step {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         match self {
-            Step::Windows(widget) => {
-                widget.render_ref(area, buf);
-            }
             Step::Welcome(widget) => {
                 widget.render_ref(area, buf);
             }
@@ -441,6 +458,6 @@ pub(crate) async fn run_onboarding_app(
     }
     Ok(OnboardingResult {
         directory_trust_decision: onboarding_screen.directory_trust_decision(),
-        windows_install_selected: onboarding_screen.windows_install_selected(),
+        should_exit: onboarding_screen.should_exit(),
     })
 }

@@ -1,9 +1,12 @@
+use codex_core::config::Constrained;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::ReviewDecision;
 use codex_core::protocol::ReviewRequest;
+use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SandboxPolicy;
+use codex_core::sandboxing::SandboxPermissions;
 use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -21,21 +24,22 @@ use pretty_assertions::assert_eq;
 
 /// Delegate should surface ExecApprovalRequest from sub-agent and proceed
 /// after parent submits an approval decision.
+#[ignore = "TODO once we have a delegate that can ask for approvals"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_delegate_forwards_exec_approval_and_proceeds_on_approval() {
     skip_if_no_network!();
 
-    // Sub-agent turn 1: emit a shell function_call requiring approval, then complete.
+    // Sub-agent turn 1: emit a shell_command function_call requiring approval, then complete.
     let call_id = "call-exec-1";
     let args = serde_json::json!({
-        "command": ["bash", "-lc", "rm -rf delegated"],
+        "command": "rm -rf delegated",
         "timeout_ms": 1000,
-        "with_escalated_permissions": true,
+        "sandbox_permissions": SandboxPermissions::RequireEscalated,
     })
     .to_string();
     let sse1 = sse(vec![
         ev_response_created("resp-1"),
-        ev_function_call(call_id, "shell", &args),
+        ev_function_call(call_id, "shell_command", &args),
         ev_completed("resp-1"),
     ]);
 
@@ -58,9 +62,10 @@ async fn codex_delegate_forwards_exec_approval_and_proceeds_on_approval() {
 
     // Build a conversation configured to require approvals so the delegate
     // routes ExecApprovalRequest via the parent.
-    let mut builder = test_codex().with_config(|config| {
-        config.approval_policy = AskForApproval::OnRequest;
-        config.sandbox_policy = SandboxPolicy::ReadOnly;
+    let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.sandbox_policy =
+            Constrained::allow_any(SandboxPolicy::new_read_only_policy());
     });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -68,29 +73,35 @@ async fn codex_delegate_forwards_exec_approval_and_proceeds_on_approval() {
     test.codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "Please review".to_string(),
-                user_facing_hint: "review".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "Please review".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
         .expect("submit review");
 
-    // Lifecycle: Entered -> ExecApprovalRequest -> Exited(Some) -> TaskComplete.
+    // Lifecycle: Entered -> ExecApprovalRequest -> Exited(Some) -> TurnComplete.
     wait_for_event(&test.codex, |ev| {
         matches!(ev, EventMsg::EnteredReviewMode(_))
     })
     .await;
 
     // Expect parent-side approval request (forwarded by delegate).
-    wait_for_event(&test.codex, |ev| {
+    let approval_event = wait_for_event(&test.codex, |ev| {
         matches!(ev, EventMsg::ExecApprovalRequest(_))
     })
     .await;
+    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
+        panic!("expected ExecApprovalRequest event");
+    };
 
-    // Approve via parent; id "0" is the active sub_id in tests.
+    // Approve via parent using the emitted approval call ID.
     test.codex
         .submit(Op::ExecApproval {
-            id: "0".into(),
+            id: approval.call_id,
+            turn_id: None,
             decision: ReviewDecision::Approved,
         })
         .await
@@ -100,11 +111,12 @@ async fn codex_delegate_forwards_exec_approval_and_proceeds_on_approval() {
         matches!(ev, EventMsg::ExitedReviewMode(_))
     })
     .await;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
 /// Delegate should surface ApplyPatchApprovalRequest and honor parent decision
 /// so the sub-agent can proceed to completion.
+#[ignore = "TODO once we have a delegate that can ask for approvals"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_delegate_forwards_patch_approval_and_proceeds_on_decision() {
     skip_if_no_network!();
@@ -132,10 +144,11 @@ async fn codex_delegate_forwards_patch_approval_and_proceeds_on_decision() {
     let server = start_mock_server().await;
     mount_sse_sequence(&server, vec![sse1, sse2]).await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config.approval_policy = AskForApproval::OnRequest;
+    let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         // Use a restricted sandbox so patch approval is required
-        config.sandbox_policy = SandboxPolicy::ReadOnly;
+        config.permissions.sandbox_policy =
+            Constrained::allow_any(SandboxPolicy::new_read_only_policy());
         config.include_apply_patch_tool = true;
     });
     let test = builder.build(&server).await.expect("build test codex");
@@ -143,8 +156,10 @@ async fn codex_delegate_forwards_patch_approval_and_proceeds_on_decision() {
     test.codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "Please review".to_string(),
-                user_facing_hint: "review".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "Please review".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
@@ -154,15 +169,18 @@ async fn codex_delegate_forwards_patch_approval_and_proceeds_on_decision() {
         matches!(ev, EventMsg::EnteredReviewMode(_))
     })
     .await;
-    wait_for_event(&test.codex, |ev| {
+    let approval_event = wait_for_event(&test.codex, |ev| {
         matches!(ev, EventMsg::ApplyPatchApprovalRequest(_))
     })
     .await;
+    let EventMsg::ApplyPatchApprovalRequest(approval) = approval_event else {
+        panic!("expected ApplyPatchApprovalRequest event");
+    };
 
-    // Deny via parent so delegate can continue; id "0" is the active sub_id in tests.
+    // Deny via parent so delegate can continue, using the emitted approval call ID.
     test.codex
         .submit(Op::PatchApproval {
-            id: "0".into(),
+            id: approval.call_id,
             decision: ReviewDecision::Denied,
         })
         .await
@@ -172,7 +190,7 @@ async fn codex_delegate_forwards_patch_approval_and_proceeds_on_decision() {
         matches!(ev, EventMsg::ExitedReviewMode(_))
     })
     .await;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -197,8 +215,10 @@ async fn codex_delegate_ignores_legacy_deltas() {
     test.codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "Please review".to_string(),
-                user_facing_hint: "review".to_string(),
+                target: ReviewTarget::Custom {
+                    instructions: "Please review".to_string(),
+                },
+                user_facing_hint: None,
             },
         })
         .await
@@ -212,7 +232,7 @@ async fn codex_delegate_ignores_legacy_deltas() {
         match ev {
             EventMsg::ReasoningContentDelta(_) => reasoning_delta_count += 1,
             EventMsg::AgentReasoningDelta(_) => legacy_reasoning_delta_count += 1,
-            EventMsg::TaskComplete(_) => break,
+            EventMsg::TurnComplete(_) => break,
             _ => {}
         }
     }

@@ -1,21 +1,36 @@
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningEvent;
+use codex_core::protocol::AgentStatus;
+use codex_core::protocol::AskForApproval;
+use codex_core::protocol::CollabAgentSpawnBeginEvent;
+use codex_core::protocol::CollabAgentSpawnEndEvent;
+use codex_core::protocol::CollabWaitingEndEvent;
 use codex_core::protocol::ErrorEvent;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
+use codex_core::protocol::ExecCommandSource;
+use codex_core::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
+use codex_core::protocol::PatchApplyStatus as CorePatchApplyStatus;
+use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::WarningEvent;
+use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_exec::event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use codex_exec::exec_events::AgentMessageItem;
+use codex_exec::exec_events::CollabAgentState;
+use codex_exec::exec_events::CollabAgentStatus;
+use codex_exec::exec_events::CollabTool;
+use codex_exec::exec_events::CollabToolCallItem;
+use codex_exec::exec_events::CollabToolCallStatus;
 use codex_exec::exec_events::CommandExecutionItem;
 use codex_exec::exec_events::CommandExecutionStatus;
 use codex_exec::exec_events::ErrorItem;
@@ -41,13 +56,18 @@ use codex_exec::exec_events::TurnFailedEvent;
 use codex_exec::exec_events::TurnStartedEvent;
 use codex_exec::exec_events::Usage;
 use codex_exec::exec_events::WebSearchItem;
+use codex_protocol::ThreadId;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::WebSearchAction;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
-use mcp_types::CallToolResult;
-use mcp_types::ContentBlock;
-use mcp_types::TextContent;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecOutputStream;
 use pretty_assertions::assert_eq;
+use rmcp::model::Content;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -63,19 +83,25 @@ fn event(id: &str, msg: EventMsg) -> Event {
 fn session_configured_produces_thread_started_event() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
     let session_id =
-        codex_protocol::ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")
-            .unwrap();
+        codex_protocol::ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
     let rollout_path = PathBuf::from("/tmp/rollout.json");
     let ev = event(
         "e1",
         EventMsg::SessionConfigured(SessionConfiguredEvent {
             session_id,
+            forked_from_id: None,
+            thread_name: None,
             model: "codex-mini-latest".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
             reasoning_effort: None,
             history_log_id: 0,
             history_entry_count: 0,
             initial_messages: None,
-            rollout_path,
+            network_proxy: None,
+            rollout_path: Some(rollout_path),
         }),
     );
     let out = ep.collect_thread_events(&ev);
@@ -92,8 +118,10 @@ fn task_started_produces_turn_started_event() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
     let out = ep.collect_thread_events(&event(
         "t1",
-        EventMsg::TaskStarted(codex_core::protocol::TaskStartedEvent {
+        EventMsg::TurnStarted(codex_core::protocol::TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
             model_context_window: Some(32_000),
+            collaboration_mode_kind: ModeKind::Default,
         }),
     ));
 
@@ -104,11 +132,16 @@ fn task_started_produces_turn_started_event() {
 fn web_search_end_emits_item_completed() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
     let query = "rust async await".to_string();
+    let action = WebSearchAction::Search {
+        query: Some(query.clone()),
+        queries: None,
+    };
     let out = ep.collect_thread_events(&event(
         "w1",
         EventMsg::WebSearchEnd(WebSearchEndEvent {
             call_id: "call-123".to_string(),
             query: query.clone(),
+            action: action.clone(),
         }),
     ));
 
@@ -117,9 +150,80 @@ fn web_search_end_emits_item_completed() {
         vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
             item: ThreadItem {
                 id: "item_0".to_string(),
-                details: ThreadItemDetails::WebSearch(WebSearchItem { query }),
+                details: ThreadItemDetails::WebSearch(WebSearchItem {
+                    id: "call-123".to_string(),
+                    query,
+                    action,
+                }),
             },
         })]
+    );
+}
+
+#[test]
+fn web_search_begin_emits_item_started() {
+    let mut ep = EventProcessorWithJsonOutput::new(None);
+    let out = ep.collect_thread_events(&event(
+        "w0",
+        EventMsg::WebSearchBegin(WebSearchBeginEvent {
+            call_id: "call-0".to_string(),
+        }),
+    ));
+
+    assert_eq!(out.len(), 1);
+    let ThreadEvent::ItemStarted(ItemStartedEvent { item }) = &out[0] else {
+        panic!("expected ItemStarted");
+    };
+    assert!(item.id.starts_with("item_"));
+    assert_eq!(
+        item.details,
+        ThreadItemDetails::WebSearch(WebSearchItem {
+            id: "call-0".to_string(),
+            query: String::new(),
+            action: WebSearchAction::Other,
+        })
+    );
+}
+
+#[test]
+fn web_search_begin_then_end_reuses_item_id() {
+    let mut ep = EventProcessorWithJsonOutput::new(None);
+    let begin = ep.collect_thread_events(&event(
+        "w0",
+        EventMsg::WebSearchBegin(WebSearchBeginEvent {
+            call_id: "call-1".to_string(),
+        }),
+    ));
+    let ThreadEvent::ItemStarted(ItemStartedEvent { item: started_item }) = &begin[0] else {
+        panic!("expected ItemStarted");
+    };
+    let action = WebSearchAction::Search {
+        query: Some("rust async await".to_string()),
+        queries: None,
+    };
+    let end = ep.collect_thread_events(&event(
+        "w1",
+        EventMsg::WebSearchEnd(WebSearchEndEvent {
+            call_id: "call-1".to_string(),
+            query: "rust async await".to_string(),
+            action: action.clone(),
+        }),
+    ));
+    let ThreadEvent::ItemCompleted(ItemCompletedEvent {
+        item: completed_item,
+    }) = &end[0]
+    else {
+        panic!("expected ItemCompleted");
+    };
+
+    assert_eq!(completed_item.id, started_item.id);
+    assert_eq!(
+        completed_item.details,
+        ThreadItemDetails::WebSearch(WebSearchItem {
+            id: "call-1".to_string(),
+            query: "rust async await".to_string(),
+            action,
+        })
     );
 }
 
@@ -208,7 +312,8 @@ fn plan_update_emits_todo_list_started_updated_and_completed() {
     // Task completes => item.completed (same id, latest state)
     let complete = event(
         "p3",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
             last_agent_message: None,
         }),
     );
@@ -284,6 +389,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 content: Vec::new(),
                 is_error: None,
                 structured_content: None,
+                meta: None,
             }),
         }),
     );
@@ -398,13 +504,10 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
             invocation,
             duration: Duration::from_millis(10),
             result: Ok(CallToolResult {
-                content: vec![ContentBlock::TextContent(TextContent {
-                    annotations: None,
-                    text: "done".to_string(),
-                    r#type: "text".to_string(),
-                })],
+                content: vec![serde_json::to_value(Content::text("done")).unwrap()],
                 is_error: None,
                 structured_content: Some(json!({ "status": "ok" })),
+                meta: None,
             }),
         }),
     );
@@ -419,15 +522,140 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                     tool: "tool_z".to_string(),
                     arguments: serde_json::Value::Null,
                     result: Some(McpToolCallItemResult {
-                        content: vec![ContentBlock::TextContent(TextContent {
-                            annotations: None,
-                            text: "done".to_string(),
-                            r#type: "text".to_string(),
-                        })],
+                        content: vec![serde_json::to_value(Content::text("done")).unwrap()],
                         structured_content: Some(json!({ "status": "ok" })),
                     }),
                     error: None,
                     status: McpToolCallStatus::Completed,
+                }),
+            },
+        })]
+    );
+}
+
+#[test]
+fn collab_spawn_begin_and_end_emit_item_events() {
+    let mut ep = EventProcessorWithJsonOutput::new(None);
+    let sender_thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
+    let new_thread_id = ThreadId::from_string("9e107d9d-372b-4b8c-a2a4-1d9bb3fce0c1").unwrap();
+    let prompt = "draft a plan".to_string();
+
+    let begin = event(
+        "c1",
+        EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+            call_id: "call-10".to_string(),
+            sender_thread_id,
+            prompt: prompt.clone(),
+        }),
+    );
+    let begin_events = ep.collect_thread_events(&begin);
+    assert_eq!(
+        begin_events,
+        vec![ThreadEvent::ItemStarted(ItemStartedEvent {
+            item: ThreadItem {
+                id: "item_0".to_string(),
+                details: ThreadItemDetails::CollabToolCall(CollabToolCallItem {
+                    tool: CollabTool::SpawnAgent,
+                    sender_thread_id: sender_thread_id.to_string(),
+                    receiver_thread_ids: Vec::new(),
+                    prompt: Some(prompt.clone()),
+                    agents_states: std::collections::HashMap::new(),
+                    status: CollabToolCallStatus::InProgress,
+                }),
+            },
+        })]
+    );
+
+    let end = event(
+        "c2",
+        EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+            call_id: "call-10".to_string(),
+            sender_thread_id,
+            new_thread_id: Some(new_thread_id),
+            prompt: prompt.clone(),
+            status: AgentStatus::Running,
+        }),
+    );
+    let end_events = ep.collect_thread_events(&end);
+    assert_eq!(
+        end_events,
+        vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+            item: ThreadItem {
+                id: "item_0".to_string(),
+                details: ThreadItemDetails::CollabToolCall(CollabToolCallItem {
+                    tool: CollabTool::SpawnAgent,
+                    sender_thread_id: sender_thread_id.to_string(),
+                    receiver_thread_ids: vec![new_thread_id.to_string()],
+                    prompt: Some(prompt),
+                    agents_states: [(
+                        new_thread_id.to_string(),
+                        CollabAgentState {
+                            status: CollabAgentStatus::Running,
+                            message: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    status: CollabToolCallStatus::Completed,
+                }),
+            },
+        })]
+    );
+}
+
+#[test]
+fn collab_wait_end_without_begin_synthesizes_failed_item() {
+    let mut ep = EventProcessorWithJsonOutput::new(None);
+    let sender_thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
+    let running_thread_id = ThreadId::from_string("3f76d2a0-943e-4f43-8a38-b289c9c6c3d1").unwrap();
+    let failed_thread_id = ThreadId::from_string("c1dfd96e-1f0c-4f26-9b4f-1aa02c2d3c4d").unwrap();
+    let mut receiver_thread_ids = vec![running_thread_id.to_string(), failed_thread_id.to_string()];
+    receiver_thread_ids.sort();
+    let mut statuses = std::collections::HashMap::new();
+    statuses.insert(
+        running_thread_id,
+        AgentStatus::Completed(Some("done".to_string())),
+    );
+    statuses.insert(failed_thread_id, AgentStatus::Errored("boom".to_string()));
+
+    let end = event(
+        "c3",
+        EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+            sender_thread_id,
+            call_id: "call-11".to_string(),
+            statuses: statuses.clone(),
+        }),
+    );
+    let events = ep.collect_thread_events(&end);
+    assert_eq!(
+        events,
+        vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+            item: ThreadItem {
+                id: "item_0".to_string(),
+                details: ThreadItemDetails::CollabToolCall(CollabToolCallItem {
+                    tool: CollabTool::Wait,
+                    sender_thread_id: sender_thread_id.to_string(),
+                    receiver_thread_ids,
+                    prompt: None,
+                    agents_states: [
+                        (
+                            running_thread_id.to_string(),
+                            CollabAgentState {
+                                status: CollabAgentStatus::Completed,
+                                message: Some("done".to_string()),
+                            },
+                        ),
+                        (
+                            failed_thread_id.to_string(),
+                            CollabAgentState {
+                                status: CollabAgentStatus::Errored,
+                                message: Some("boom".to_string()),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    status: CollabToolCallStatus::Failed,
                 }),
             },
         })]
@@ -452,7 +680,8 @@ fn plan_update_after_complete_starts_new_todo_list_with_new_id() {
     let _ = ep.collect_thread_events(&start);
     let complete = event(
         "t2",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
             last_agent_message: None,
         }),
     );
@@ -532,6 +761,7 @@ fn error_event_produces_error() {
         "e1",
         EventMsg::Error(codex_core::protocol::ErrorEvent {
             message: "boom".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
         }),
     ));
     assert_eq!(
@@ -571,6 +801,8 @@ fn stream_error_event_produces_error() {
         "e1",
         EventMsg::StreamError(codex_core::protocol::StreamErrorEvent {
             message: "retrying".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            additional_details: None,
         }),
     ));
     assert_eq!(
@@ -589,6 +821,7 @@ fn error_followed_by_task_complete_produces_turn_failed() {
         "e1",
         EventMsg::Error(ErrorEvent {
             message: "boom".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
         }),
     );
     assert_eq!(
@@ -600,7 +833,8 @@ fn error_followed_by_task_complete_produces_turn_failed() {
 
     let complete_event = event(
         "e2",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
             last_agent_message: None,
         }),
     );
@@ -617,16 +851,22 @@ fn error_followed_by_task_complete_produces_turn_failed() {
 #[test]
 fn exec_command_end_success_produces_completed_command_item() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
+    let command = vec!["bash".to_string(), "-lc".to_string(), "echo hi".to_string()];
+    let cwd = std::env::current_dir().unwrap();
+    let parsed_cmd = Vec::new();
 
     // Begin -> no output
     let begin = event(
         "c1",
         EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
             call_id: "1".to_string(),
-            command: vec!["bash".to_string(), "-lc".to_string(), "echo hi".to_string()],
-            cwd: std::env::current_dir().unwrap(),
-            parsed_cmd: Vec::new(),
-            is_user_shell_command: false,
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: command.clone(),
+            cwd: cwd.clone(),
+            parsed_cmd: parsed_cmd.clone(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
         }),
     );
     let out_begin = ep.collect_thread_events(&begin);
@@ -650,12 +890,20 @@ fn exec_command_end_success_produces_completed_command_item() {
         "c2",
         EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: "1".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command,
+            cwd,
+            parsed_cmd,
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
             stdout: String::new(),
             stderr: String::new(),
             aggregated_output: "hi\n".to_string(),
             exit_code: 0,
             duration: Duration::from_millis(5),
             formatted_output: String::new(),
+            status: CoreExecCommandStatus::Completed,
         }),
     );
     let out_ok = ep.collect_thread_events(&end_ok);
@@ -676,18 +924,112 @@ fn exec_command_end_success_produces_completed_command_item() {
 }
 
 #[test]
+fn command_execution_output_delta_updates_item_progress() {
+    let mut ep = EventProcessorWithJsonOutput::new(None);
+    let command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "echo delta".to_string(),
+    ];
+    let cwd = std::env::current_dir().unwrap();
+    let parsed_cmd = Vec::new();
+
+    let begin = event(
+        "d1",
+        EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            call_id: "delta-1".to_string(),
+            process_id: Some("42".to_string()),
+            turn_id: "turn-1".to_string(),
+            command: command.clone(),
+            cwd: cwd.clone(),
+            parsed_cmd: parsed_cmd.clone(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+        }),
+    );
+    let out_begin = ep.collect_thread_events(&begin);
+    assert_eq!(
+        out_begin,
+        vec![ThreadEvent::ItemStarted(ItemStartedEvent {
+            item: ThreadItem {
+                id: "item_0".to_string(),
+                details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                    command: "bash -lc 'echo delta'".to_string(),
+                    aggregated_output: String::new(),
+                    exit_code: None,
+                    status: CommandExecutionStatus::InProgress,
+                }),
+            },
+        })]
+    );
+
+    let delta = event(
+        "d2",
+        EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: "delta-1".to_string(),
+            stream: ExecOutputStream::Stdout,
+            chunk: b"partial output\n".to_vec(),
+        }),
+    );
+    let out_delta = ep.collect_thread_events(&delta);
+    assert_eq!(out_delta, Vec::<ThreadEvent>::new());
+
+    let end = event(
+        "d3",
+        EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            call_id: "delta-1".to_string(),
+            process_id: Some("42".to_string()),
+            turn_id: "turn-1".to_string(),
+            command,
+            cwd,
+            parsed_cmd,
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            aggregated_output: String::new(),
+            exit_code: 0,
+            duration: Duration::from_millis(3),
+            formatted_output: String::new(),
+            status: CoreExecCommandStatus::Completed,
+        }),
+    );
+    let out_end = ep.collect_thread_events(&end);
+    assert_eq!(
+        out_end,
+        vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+            item: ThreadItem {
+                id: "item_0".to_string(),
+                details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                    command: "bash -lc 'echo delta'".to_string(),
+                    aggregated_output: String::new(),
+                    exit_code: Some(0),
+                    status: CommandExecutionStatus::Completed,
+                }),
+            },
+        })]
+    );
+}
+
+#[test]
 fn exec_command_end_failure_produces_failed_command_item() {
     let mut ep = EventProcessorWithJsonOutput::new(None);
+    let command = vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()];
+    let cwd = std::env::current_dir().unwrap();
+    let parsed_cmd = Vec::new();
 
     // Begin -> no output
     let begin = event(
         "c1",
         EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
             call_id: "2".to_string(),
-            command: vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
-            cwd: std::env::current_dir().unwrap(),
-            parsed_cmd: Vec::new(),
-            is_user_shell_command: false,
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: command.clone(),
+            cwd: cwd.clone(),
+            parsed_cmd: parsed_cmd.clone(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
         }),
     );
     assert_eq!(
@@ -710,12 +1052,20 @@ fn exec_command_end_failure_produces_failed_command_item() {
         "c2",
         EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: "2".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command,
+            cwd,
+            parsed_cmd,
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
             stdout: String::new(),
             stderr: String::new(),
             aggregated_output: String::new(),
             exit_code: 1,
             duration: Duration::from_millis(2),
             formatted_output: String::new(),
+            status: CoreExecCommandStatus::Failed,
         }),
     );
     let out_fail = ep.collect_thread_events(&end_fail);
@@ -744,12 +1094,20 @@ fn exec_command_end_without_begin_is_ignored() {
         "c1",
         EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: "no-begin".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: Vec::new(),
+            cwd: PathBuf::from("."),
+            parsed_cmd: Vec::new(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
             stdout: String::new(),
             stderr: String::new(),
             aggregated_output: String::new(),
             exit_code: 0,
             duration: Duration::from_millis(1),
             formatted_output: String::new(),
+            status: CoreExecCommandStatus::Completed,
         }),
     );
     let out = ep.collect_thread_events(&end_only);
@@ -787,6 +1145,7 @@ fn patch_apply_success_produces_item_completed_patchapply() {
         "p1",
         EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
             call_id: "call-1".to_string(),
+            turn_id: "turn-1".to_string(),
             auto_approved: true,
             changes: changes.clone(),
         }),
@@ -799,9 +1158,12 @@ fn patch_apply_success_produces_item_completed_patchapply() {
         "p2",
         EventMsg::PatchApplyEnd(PatchApplyEndEvent {
             call_id: "call-1".to_string(),
+            turn_id: "turn-1".to_string(),
             stdout: "applied 3 changes".to_string(),
             stderr: String::new(),
             success: true,
+            changes: changes.clone(),
+            status: CorePatchApplyStatus::Completed,
         }),
     );
     let out_end = ep.collect_thread_events(&end);
@@ -856,6 +1218,7 @@ fn patch_apply_failure_produces_item_completed_patchapply_failed() {
         "p1",
         EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
             call_id: "call-2".to_string(),
+            turn_id: "turn-2".to_string(),
             auto_approved: false,
             changes: changes.clone(),
         }),
@@ -867,9 +1230,12 @@ fn patch_apply_failure_produces_item_completed_patchapply_failed() {
         "p2",
         EventMsg::PatchApplyEnd(PatchApplyEndEvent {
             call_id: "call-2".to_string(),
+            turn_id: "turn-2".to_string(),
             stdout: String::new(),
             stderr: "failed to apply".to_string(),
             success: false,
+            changes: changes.clone(),
+            status: CorePatchApplyStatus::Failed,
         }),
     );
     let out_end = ep.collect_thread_events(&end);
@@ -918,10 +1284,11 @@ fn task_complete_produces_turn_completed_with_usage() {
     );
     assert!(ep.collect_thread_events(&token_count_event).is_empty());
 
-    // Then TaskComplete should produce turn.completed with the captured usage.
+    // Then TurnComplete should produce turn.completed with the captured usage.
     let complete_event = event(
         "e2",
-        EventMsg::TaskComplete(codex_core::protocol::TaskCompleteEvent {
+        EventMsg::TurnComplete(codex_core::protocol::TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
             last_agent_message: Some("done".to_string()),
         }),
     );

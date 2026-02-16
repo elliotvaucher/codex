@@ -1,16 +1,12 @@
+use crate::config_loader::ResidencyRequirement;
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
-use http::Error as HttpError;
-use reqwest::IntoUrl;
-use reqwest::Method;
-use reqwest::Response;
-use reqwest::header::HeaderName;
+use codex_client::CodexHttpClient;
+pub use codex_client::CodexRequestBuilder;
+use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
-use serde::Serialize;
-use std::collections::HashMap;
-use std::fmt::Display;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 /// Set this to add a suffix to the User-Agent string.
 ///
@@ -30,136 +26,16 @@ use std::sync::OnceLock;
 pub static USER_AGENT_SUFFIX: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+pub const RESIDENCY_HEADER_NAME: &str = "x-openai-internal-codex-residency";
 
-#[derive(Clone, Debug)]
-pub struct CodexHttpClient {
-    inner: reqwest::Client,
-}
-
-impl CodexHttpClient {
-    fn new(inner: reqwest::Client) -> Self {
-        Self { inner }
-    }
-
-    pub fn get<U>(&self, url: U) -> CodexRequestBuilder
-    where
-        U: IntoUrl,
-    {
-        self.request(Method::GET, url)
-    }
-
-    pub fn post<U>(&self, url: U) -> CodexRequestBuilder
-    where
-        U: IntoUrl,
-    {
-        self.request(Method::POST, url)
-    }
-
-    pub fn request<U>(&self, method: Method, url: U) -> CodexRequestBuilder
-    where
-        U: IntoUrl,
-    {
-        let url_str = url.as_str().to_string();
-        CodexRequestBuilder::new(self.inner.request(method.clone(), url), method, url_str)
-    }
-}
-
-#[must_use = "requests are not sent unless `send` is awaited"]
-#[derive(Debug)]
-pub struct CodexRequestBuilder {
-    builder: reqwest::RequestBuilder,
-    method: Method,
-    url: String,
-}
-
-impl CodexRequestBuilder {
-    fn new(builder: reqwest::RequestBuilder, method: Method, url: String) -> Self {
-        Self {
-            builder,
-            method,
-            url,
-        }
-    }
-
-    fn map(self, f: impl FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder) -> Self {
-        Self {
-            builder: f(self.builder),
-            method: self.method,
-            url: self.url,
-        }
-    }
-
-    pub fn header<K, V>(self, key: K, value: V) -> Self
-    where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
-        HeaderValue: TryFrom<V>,
-        <HeaderValue as TryFrom<V>>::Error: Into<HttpError>,
-    {
-        self.map(|builder| builder.header(key, value))
-    }
-
-    pub fn bearer_auth<T>(self, token: T) -> Self
-    where
-        T: Display,
-    {
-        self.map(|builder| builder.bearer_auth(token))
-    }
-
-    pub fn json<T>(self, value: &T) -> Self
-    where
-        T: ?Sized + Serialize,
-    {
-        self.map(|builder| builder.json(value))
-    }
-
-    pub async fn send(self) -> Result<Response, reqwest::Error> {
-        match self.builder.send().await {
-            Ok(response) => {
-                let request_ids = Self::extract_request_ids(&response);
-                tracing::debug!(
-                    method = %self.method,
-                    url = %self.url,
-                    status = %response.status(),
-                    request_ids = ?request_ids,
-                    version = ?response.version(),
-                    "Request completed"
-                );
-
-                Ok(response)
-            }
-            Err(error) => {
-                let status = error.status();
-                tracing::debug!(
-                    method = %self.method,
-                    url = %self.url,
-                    status = status.map(|s| s.as_u16()),
-                    error = %error,
-                    "Request failed"
-                );
-                Err(error)
-            }
-        }
-    }
-
-    fn extract_request_ids(response: &Response) -> HashMap<String, String> {
-        ["cf-ray", "x-request-id", "x-oai-request-id"]
-            .iter()
-            .filter_map(|&name| {
-                let header_name = HeaderName::from_static(name);
-                let value = response.headers().get(header_name)?;
-                let value = value.to_str().ok()?.to_owned();
-                Some((name.to_owned(), value))
-            })
-            .collect()
-    }
-}
 #[derive(Debug, Clone)]
 pub struct Originator {
     pub value: String,
     pub header_value: HeaderValue,
 }
-static ORIGINATOR: OnceLock<Originator> = OnceLock::new();
+static ORIGINATOR: LazyLock<RwLock<Option<Originator>>> = LazyLock::new(|| RwLock::new(None));
+static REQUIREMENTS_RESIDENCY: LazyLock<RwLock<Option<ResidencyRequirement>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 #[derive(Debug)]
 pub enum SetOriginatorError {
@@ -189,22 +65,62 @@ fn get_originator_value(provided: Option<String>) -> Originator {
 }
 
 pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
+    if HeaderValue::from_str(&value).is_err() {
+        return Err(SetOriginatorError::InvalidHeaderValue);
+    }
     let originator = get_originator_value(Some(value));
-    ORIGINATOR
-        .set(originator)
-        .map_err(|_| SetOriginatorError::AlreadyInitialized)
+    let Ok(mut guard) = ORIGINATOR.write() else {
+        return Err(SetOriginatorError::AlreadyInitialized);
+    };
+    if guard.is_some() {
+        return Err(SetOriginatorError::AlreadyInitialized);
+    }
+    *guard = Some(originator);
+    Ok(())
 }
 
-pub fn originator() -> &'static Originator {
-    ORIGINATOR.get_or_init(|| get_originator_value(None))
+pub fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyRequirement>) {
+    let Ok(mut guard) = REQUIREMENTS_RESIDENCY.write() else {
+        tracing::warn!("Failed to acquire requirements residency lock");
+        return;
+    };
+    *guard = enforce_residency;
+}
+
+pub fn originator() -> Originator {
+    if let Ok(guard) = ORIGINATOR.read()
+        && let Some(originator) = guard.as_ref()
+    {
+        return originator.clone();
+    }
+
+    if std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).is_ok() {
+        let originator = get_originator_value(None);
+        if let Ok(mut guard) = ORIGINATOR.write() {
+            match guard.as_ref() {
+                Some(originator) => return originator.clone(),
+                None => *guard = Some(originator.clone()),
+            }
+        }
+        return originator;
+    }
+
+    get_originator_value(None)
+}
+
+pub fn is_first_party_originator(originator_value: &str) -> bool {
+    originator_value == DEFAULT_ORIGINATOR
+        || originator_value == "codex_vscode"
+        || originator_value.starts_with("Codex ")
 }
 
 pub fn get_codex_user_agent() -> String {
     let build_version = env!("CARGO_PKG_VERSION");
     let os_info = os_info::get();
+    let originator = originator();
     let prefix = format!(
         "{}/{build_version} ({} {}; {}) {}",
-        originator().value.as_str(),
+        originator.value.as_str(),
         os_info.os_type(),
         os_info.version(),
         os_info.architecture().unwrap_or("unknown"),
@@ -252,28 +168,43 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
         tracing::warn!(
             "Falling back to default Codex originator because base user agent string is invalid"
         );
-        originator().value.clone()
+        originator().value
     }
 }
 
 /// Create an HTTP client with default `originator` and `User-Agent` headers set.
 pub fn create_client() -> CodexHttpClient {
-    use reqwest::header::HeaderMap;
+    let inner = build_reqwest_client();
+    CodexHttpClient::new(inner)
+}
 
-    let mut headers = HeaderMap::new();
-    headers.insert("originator", originator().header_value.clone());
+pub fn build_reqwest_client() -> reqwest::Client {
     let ua = get_codex_user_agent();
 
     let mut builder = reqwest::Client::builder()
         // Set UA via dedicated helper to avoid header validation pitfalls
         .user_agent(ua)
-        .default_headers(headers);
+        .default_headers(default_headers());
     if is_sandboxed() {
         builder = builder.no_proxy();
     }
 
-    let inner = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-    CodexHttpClient::new(inner)
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+pub fn default_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("originator", originator().header_value);
+    if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()
+        && let Some(requirement) = guard.as_ref()
+        && !headers.contains_key(RESIDENCY_HEADER_NAME)
+    {
+        let value = match requirement {
+            ResidencyRequirement::Us => HeaderValue::from_static("us"),
+        };
+        headers.insert(RESIDENCY_HEADER_NAME, value);
+    }
+    headers
 }
 
 fn is_sandboxed() -> bool {
@@ -284,16 +215,30 @@ fn is_sandboxed() -> bool {
 mod tests {
     use super::*;
     use core_test_support::skip_if_no_network;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_get_codex_user_agent() {
         let user_agent = get_codex_user_agent();
-        assert!(user_agent.starts_with("codex_cli_rs/"));
+        let originator = originator().value;
+        let prefix = format!("{originator}/");
+        assert!(user_agent.starts_with(&prefix));
+    }
+
+    #[test]
+    fn is_first_party_originator_matches_known_values() {
+        assert_eq!(is_first_party_originator(DEFAULT_ORIGINATOR), true);
+        assert_eq!(is_first_party_originator("codex_vscode"), true);
+        assert_eq!(is_first_party_originator("Codex Something Else"), true);
+        assert_eq!(is_first_party_originator("codex_cli"), false);
+        assert_eq!(is_first_party_originator("Other"), false);
     }
 
     #[tokio::test]
     async fn test_create_client_sets_default_headers() {
         skip_if_no_network!();
+
+        set_default_client_residency_requirement(Some(ResidencyRequirement::Us));
 
         use wiremock::Mock;
         use wiremock::MockServer;
@@ -329,7 +274,7 @@ mod tests {
         let originator_header = headers
             .get("originator")
             .expect("originator header missing");
-        assert_eq!(originator_header.to_str().unwrap(), "codex_cli_rs");
+        assert_eq!(originator_header.to_str().unwrap(), originator().value);
 
         // User-Agent matches the computed Codex UA for that originator
         let expected_ua = get_codex_user_agent();
@@ -337,6 +282,13 @@ mod tests {
             .get("user-agent")
             .expect("user-agent header missing");
         assert_eq!(ua_header.to_str().unwrap(), expected_ua);
+
+        let residency_header = headers
+            .get(RESIDENCY_HEADER_NAME)
+            .expect("residency header missing");
+        assert_eq!(residency_header.to_str().unwrap(), "us");
+
+        set_default_client_residency_requirement(None);
     }
 
     #[test]
@@ -366,9 +318,10 @@ mod tests {
     fn test_macos() {
         use regex_lite::Regex;
         let user_agent = get_codex_user_agent();
-        let re = Regex::new(
-            r"^codex_cli_rs/\d+\.\d+\.\d+ \(Mac OS \d+\.\d+\.\d+; (x86_64|arm64)\) (\S+)$",
-        )
+        let originator = regex_lite::escape(originator().value.as_str());
+        let re = Regex::new(&format!(
+            r"^{originator}/\d+\.\d+\.\d+ \(Mac OS \d+\.\d+\.\d+; (x86_64|arm64)\) (\S+)$"
+        ))
         .unwrap();
         assert!(re.is_match(&user_agent));
     }
