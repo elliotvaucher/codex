@@ -46,13 +46,23 @@ impl ApplyPatchRuntime {
         Self
     }
 
-    fn build_command_spec(req: &ApplyPatchRequest) -> Result<CommandSpec, ToolError> {
-        use std::env;
+    fn build_command_spec(
+        req: &ApplyPatchRequest,
+        _codex_home: &std::path::Path,
+    ) -> Result<CommandSpec, ToolError> {
         let exe = if let Some(path) = &req.codex_exe {
             path.clone()
         } else {
-            env::current_exe()
-                .map_err(|e| ToolError::Rejected(format!("failed to determine codex exe: {e}")))?
+            #[cfg(target_os = "windows")]
+            {
+                codex_windows_sandbox::resolve_current_exe_for_launch(_codex_home, "codex.exe")
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                std::env::current_exe().map_err(|e| {
+                    ToolError::Rejected(format!("failed to determine codex exe: {e}"))
+                })?
+            }
         };
         let program = exe.to_string_lossy().to_string();
         Ok(CommandSpec {
@@ -66,6 +76,7 @@ impl ApplyPatchRuntime {
             // Run apply_patch with a minimal environment for determinism and to avoid leaks.
             env: HashMap::new(),
             sandbox_permissions: SandboxPermissions::UseDefault,
+            additional_permissions: None,
             justification: None,
         })
     }
@@ -158,11 +169,11 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        let spec = Self::build_command_spec(req)?;
+        let spec = Self::build_command_spec(req, &ctx.turn.config.codex_home)?;
         let env = attempt
             .env_for(spec, None)
             .map_err(|err| ToolError::Codex(err.into()))?;
-        let out = execute_env(env, attempt.policy, Self::stdout_stream(ctx))
+        let out = execute_env(env, Self::stdout_stream(ctx))
             .await
             .map_err(ToolError::Codex)?;
         Ok(out)

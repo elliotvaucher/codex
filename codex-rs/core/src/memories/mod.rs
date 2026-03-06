@@ -4,6 +4,8 @@
 //! - Phase 1: select rollouts, extract stage-1 raw memories, persist stage-1 outputs, and enqueue consolidation.
 //! - Phase 2: claim a global consolidation lock, materialize consolidation inputs, and dispatch one consolidation agent.
 
+pub(crate) mod citations;
+mod control;
 mod phase1;
 mod phase2;
 pub(crate) mod prompts;
@@ -15,6 +17,7 @@ pub(crate) mod usage;
 
 use codex_protocol::openai_models::ReasoningEffort;
 
+pub(crate) use control::clear_memory_root_contents;
 /// Starts the memory startup pipeline for eligible root sessions.
 /// This is the single entrypoint that `codex` uses to trigger memory startup.
 ///
