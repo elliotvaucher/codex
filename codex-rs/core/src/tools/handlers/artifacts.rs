@@ -15,9 +15,10 @@ use crate::exec::ExecToolCallOutput;
 use crate::exec::StreamOutput;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
+use crate::packages::versions;
 use crate::protocol::ExecCommandSource;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
@@ -25,11 +26,9 @@ use crate::tools::events::ToolEventFailure;
 use crate::tools::events::ToolEventStage;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use codex_protocol::models::FunctionCallOutputBody;
 
 const ARTIFACTS_TOOL_NAME: &str = "artifacts";
 const ARTIFACTS_PRAGMA_PREFIXES: [&str; 2] = ["// codex-artifacts:", "// codex-artifact-tool:"];
-pub(crate) const PINNED_ARTIFACT_RUNTIME_VERSION: &str = "2.4.0";
 const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ArtifactsHandler;
@@ -42,6 +41,8 @@ struct ArtifactsToolArgs {
 
 #[async_trait]
 impl ToolHandler for ArtifactsHandler {
+    type Output = FunctionToolOutput;
+
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
@@ -54,7 +55,7 @@ impl ToolHandler for ArtifactsHandler {
         true
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -112,10 +113,10 @@ impl ToolHandler for ArtifactsHandler {
         )
         .await;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(format_artifact_output(&output)),
-            success: Some(success),
-        })
+        Ok(FunctionToolOutput::from_text(
+            format_artifact_output(&output),
+            Some(success),
+        ))
     }
 }
 
@@ -215,7 +216,7 @@ fn parse_pragma_prefix(line: &str) -> Option<&str> {
 fn default_runtime_manager(codex_home: std::path::PathBuf) -> ArtifactRuntimeManager {
     ArtifactRuntimeManager::new(ArtifactRuntimeManagerConfig::with_default_release(
         codex_home,
-        PINNED_ARTIFACT_RUNTIME_VERSION,
+        versions::ARTIFACT_RUNTIME,
     ))
 }
 
@@ -224,9 +225,9 @@ async fn emit_exec_begin(session: &Session, turn: &TurnContext, call_id: &str) {
         vec![ARTIFACTS_TOOL_NAME.to_string()],
         turn.cwd.clone(),
         ExecCommandSource::Agent,
-        true,
+        /*freeform*/ true,
     );
-    let ctx = ToolEventCtx::new(session, turn, call_id, None);
+    let ctx = ToolEventCtx::new(session, turn, call_id, /*turn_diff_tracker*/ None);
     emitter.emit(ctx, ToolEventStage::Begin).await;
 }
 
@@ -250,9 +251,9 @@ async fn emit_exec_end(
         vec![ARTIFACTS_TOOL_NAME.to_string()],
         turn.cwd.clone(),
         ExecCommandSource::Agent,
-        true,
+        /*freeform*/ true,
     );
-    let ctx = ToolEventCtx::new(session, turn, call_id, None);
+    let ctx = ToolEventCtx::new(session, turn, call_id, /*turn_diff_tracker*/ None);
     let stage = if success {
         ToolEventStage::Success(exec_output)
     } else {
@@ -292,130 +293,5 @@ fn error_output(error: &ArtifactsError) -> ArtifactCommandOutput {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_artifacts::RuntimeEntrypoints;
-    use codex_artifacts::RuntimePathEntry;
-    use tempfile::TempDir;
-
-    #[test]
-    fn parse_freeform_args_without_pragma() {
-        let args = parse_freeform_args("console.log('ok');").expect("parse args");
-        assert_eq!(args.source, "console.log('ok');");
-        assert_eq!(args.timeout_ms, None);
-    }
-
-    #[test]
-    fn parse_freeform_args_with_pragma() {
-        let args = parse_freeform_args("// codex-artifacts: timeout_ms=45000\nconsole.log('ok');")
-            .expect("parse args");
-        assert_eq!(args.source, "console.log('ok');");
-        assert_eq!(args.timeout_ms, Some(45_000));
-    }
-
-    #[test]
-    fn parse_freeform_args_with_artifact_tool_pragma() {
-        let args =
-            parse_freeform_args("// codex-artifact-tool: timeout_ms=45000\nconsole.log('ok');")
-                .expect("parse args");
-        assert_eq!(args.source, "console.log('ok');");
-        assert_eq!(args.timeout_ms, Some(45_000));
-    }
-
-    #[test]
-    fn parse_freeform_args_rejects_json_wrapped_code() {
-        let err =
-            parse_freeform_args("{\"code\":\"console.log('ok')\"}").expect_err("expected error");
-        assert!(
-            err.to_string()
-                .contains("artifacts is a freeform tool and expects raw JavaScript source")
-        );
-    }
-
-    #[test]
-    fn default_runtime_manager_uses_openai_codex_release_base() {
-        let codex_home = TempDir::new().expect("create temp codex home");
-        let manager = default_runtime_manager(codex_home.path().to_path_buf());
-
-        assert_eq!(
-            manager.config().release().base_url().as_str(),
-            "https://github.com/openai/codex/releases/download/"
-        );
-        assert_eq!(
-            manager.config().release().runtime_version(),
-            PINNED_ARTIFACT_RUNTIME_VERSION
-        );
-    }
-
-    #[test]
-    fn load_cached_runtime_reads_pinned_cache_path() {
-        let codex_home = TempDir::new().expect("create temp codex home");
-        let platform =
-            codex_artifacts::ArtifactRuntimePlatform::detect_current().expect("detect platform");
-        let install_dir = codex_home
-            .path()
-            .join("packages")
-            .join("artifacts")
-            .join(PINNED_ARTIFACT_RUNTIME_VERSION)
-            .join(platform.as_str());
-        std::fs::create_dir_all(&install_dir).expect("create install dir");
-        std::fs::write(
-            install_dir.join("manifest.json"),
-            serde_json::json!({
-                "schema_version": 1,
-                "runtime_version": PINNED_ARTIFACT_RUNTIME_VERSION,
-                "node": { "relative_path": "node/bin/node" },
-                "entrypoints": {
-                    "build_js": { "relative_path": "artifact-tool/dist/artifact_tool.mjs" },
-                    "render_cli": { "relative_path": "granola-render/dist/render_cli.mjs" }
-                }
-            })
-            .to_string(),
-        )
-        .expect("write manifest");
-        std::fs::create_dir_all(install_dir.join("artifact-tool/dist"))
-            .expect("create build entrypoint dir");
-        std::fs::create_dir_all(install_dir.join("granola-render/dist"))
-            .expect("create render entrypoint dir");
-        std::fs::write(
-            install_dir.join("artifact-tool/dist/artifact_tool.mjs"),
-            "export const ok = true;\n",
-        )
-        .expect("write build entrypoint");
-        std::fs::write(
-            install_dir.join("granola-render/dist/render_cli.mjs"),
-            "export const ok = true;\n",
-        )
-        .expect("write render entrypoint");
-
-        let runtime = codex_artifacts::load_cached_runtime(
-            &codex_home
-                .path()
-                .join(codex_artifacts::DEFAULT_CACHE_ROOT_RELATIVE),
-            PINNED_ARTIFACT_RUNTIME_VERSION,
-        )
-        .expect("resolve runtime");
-        assert_eq!(runtime.runtime_version(), PINNED_ARTIFACT_RUNTIME_VERSION);
-        assert_eq!(
-            runtime.manifest().entrypoints,
-            RuntimeEntrypoints {
-                build_js: RuntimePathEntry {
-                    relative_path: "artifact-tool/dist/artifact_tool.mjs".to_string(),
-                },
-                render_cli: RuntimePathEntry {
-                    relative_path: "granola-render/dist/render_cli.mjs".to_string(),
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn format_artifact_output_includes_success_message_when_silent() {
-        let formatted = format_artifact_output(&ArtifactCommandOutput {
-            exit_code: Some(0),
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-        assert!(formatted.contains("artifact JS completed successfully."));
-    }
-}
+#[path = "artifacts_tests.rs"]
+mod tests;

@@ -28,6 +28,7 @@ use crate::render::renderable::RenderableItem;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
 use codex_core::features::Features;
+use codex_core::plugins::PluginCapabilitySummary;
 use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
 use codex_protocol::request_user_input::RequestUserInputEvent;
@@ -46,10 +47,13 @@ mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
 mod status_line_setup;
+pub(crate) use app_link_view::AppLinkElicitationTarget;
+pub(crate) use app_link_view::AppLinkSuggestionType;
 pub(crate) use app_link_view::AppLinkView;
 pub(crate) use app_link_view::AppLinkViewParams;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
+pub(crate) use approval_overlay::format_requested_permissions_rule;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
@@ -254,6 +258,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub fn set_plugin_mentions(&mut self, plugins: Option<Vec<PluginCapabilitySummary>>) {
+        self.composer.set_plugin_mentions(plugins);
+        self.request_redraw();
+    }
+
     pub fn take_mention_bindings(&mut self) -> Vec<MentionBinding> {
         self.composer.take_mention_bindings()
     }
@@ -331,6 +340,10 @@ impl BottomPane {
 
     pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
         self.composer.skills()
+    }
+
+    pub fn plugins(&self) -> Option<&Vec<PluginCapabilitySummary>> {
+        self.composer.plugins()
     }
 
     #[cfg(test)]
@@ -680,16 +693,21 @@ impl BottomPane {
         self.status.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn status_line_text(&self) -> Option<String> {
+        self.composer.status_line_text()
+    }
+
     pub(crate) fn show_esc_backtrack_hint(&mut self) {
         self.esc_backtrack_hint = true;
-        self.composer.set_esc_backtrack_hint(true);
+        self.composer.set_esc_backtrack_hint(/*show*/ true);
         self.request_redraw();
     }
 
     pub(crate) fn clear_esc_backtrack_hint(&mut self) {
         if self.esc_backtrack_hint {
             self.esc_backtrack_hint = false;
-            self.composer.set_esc_backtrack_hint(false);
+            self.composer.set_esc_backtrack_hint(/*show*/ false);
             self.request_redraw();
         }
     }
@@ -711,7 +729,7 @@ impl BottomPane {
                     ));
                 }
                 if let Some(status) = self.status.as_mut() {
-                    status.set_interrupt_hint_visible(true);
+                    status.set_interrupt_hint_visible(/*visible*/ true);
                 }
                 self.sync_status_inline_message();
                 self.request_redraw();
@@ -785,6 +803,13 @@ impl BottomPane {
         let view = list_selection_view::ListSelectionView::new(params, self.app_event_tx.clone());
         self.push_view(Box::new(view));
         true
+    }
+
+    pub(crate) fn selected_index_for_active_view(&self, view_id: &'static str) -> Option<usize> {
+        self.view_stack
+            .last()
+            .filter(|view| view.view_id() == Some(view_id))
+            .and_then(|view| view.selected_index())
     }
 
     /// Update the pending-input preview shown above the composer.
@@ -918,7 +943,7 @@ impl BottomPane {
         );
         self.pause_status_timer_for_modal();
         self.set_composer_input_enabled(
-            false,
+            /*enabled*/ false,
             Some("Answer the questions to continue.".to_string()),
         );
         self.push_view(Box::new(modal));
@@ -940,6 +965,52 @@ impl BottomPane {
             request
         };
 
+        if let Some(tool_suggestion) = request.tool_suggestion() {
+            let suggestion_type = match tool_suggestion.suggest_type {
+                mcp_server_elicitation::ToolSuggestionType::Install => {
+                    AppLinkSuggestionType::Install
+                }
+                mcp_server_elicitation::ToolSuggestionType::Enable => AppLinkSuggestionType::Enable,
+            };
+            let is_installed = matches!(
+                tool_suggestion.suggest_type,
+                mcp_server_elicitation::ToolSuggestionType::Enable
+            );
+            let view = AppLinkView::new(
+                AppLinkViewParams {
+                    app_id: tool_suggestion.tool_id.clone(),
+                    title: tool_suggestion.tool_name.clone(),
+                    description: None,
+                    instructions: match suggestion_type {
+                        AppLinkSuggestionType::Install => {
+                            "Install this app in your browser, then return here.".to_string()
+                        }
+                        AppLinkSuggestionType::Enable => {
+                            "Enable this app to use it for the current request.".to_string()
+                        }
+                    },
+                    url: tool_suggestion.install_url.clone(),
+                    is_installed,
+                    is_enabled: false,
+                    suggest_reason: Some(tool_suggestion.suggest_reason.clone()),
+                    suggestion_type: Some(suggestion_type),
+                    elicitation_target: Some(AppLinkElicitationTarget {
+                        thread_id: request.thread_id(),
+                        server_name: request.server_name().to_string(),
+                        request_id: request.request_id().clone(),
+                    }),
+                },
+                self.app_event_tx.clone(),
+            );
+            self.pause_status_timer_for_modal();
+            self.set_composer_input_enabled(
+                /*enabled*/ false,
+                Some("Respond to the tool suggestion to continue.".to_string()),
+            );
+            self.push_view(Box::new(view));
+            return;
+        }
+
         let modal = McpServerElicitationOverlay::new(
             request,
             self.app_event_tx.clone(),
@@ -949,7 +1020,7 @@ impl BottomPane {
         );
         self.pause_status_timer_for_modal();
         self.set_composer_input_enabled(
-            false,
+            /*enabled*/ false,
             Some("Respond to the MCP server request to continue.".to_string()),
         );
         self.push_view(Box::new(modal));
@@ -957,7 +1028,7 @@ impl BottomPane {
 
     fn on_active_view_complete(&mut self) {
         self.resume_status_timer_after_modal();
-        self.set_composer_input_enabled(true, None);
+        self.set_composer_input_enabled(/*enabled*/ true, /*placeholder*/ None);
     }
 
     fn pause_status_timer_for_modal(&mut self) {
@@ -1060,12 +1131,15 @@ impl BottomPane {
         } else {
             let mut flex = FlexRenderable::new();
             if let Some(status) = &self.status {
-                flex.push(0, RenderableItem::Borrowed(status));
+                flex.push(/*flex*/ 0, RenderableItem::Borrowed(status));
             }
             // Avoid double-surfacing the same summary and avoid adding an extra
             // row while the status line is already visible.
             if self.status.is_none() && !self.unified_exec_footer.is_empty() {
-                flex.push(0, RenderableItem::Borrowed(&self.unified_exec_footer));
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Borrowed(&self.unified_exec_footer),
+                );
             }
             let has_pending_thread_approvals = !self.pending_thread_approvals.is_empty();
             let has_pending_input = !self.pending_input_preview.queued_messages.is_empty()
@@ -1074,19 +1148,25 @@ impl BottomPane {
                 self.status.is_some() || !self.unified_exec_footer.is_empty();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
             if has_inline_previews && has_status_or_footer {
-                flex.push(0, RenderableItem::Owned("".into()));
+                flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
             }
-            flex.push(1, RenderableItem::Borrowed(&self.pending_thread_approvals));
+            flex.push(
+                /*flex*/ 1,
+                RenderableItem::Borrowed(&self.pending_thread_approvals),
+            );
             if has_pending_thread_approvals && has_pending_input {
-                flex.push(0, RenderableItem::Owned("".into()));
+                flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
             }
-            flex.push(1, RenderableItem::Borrowed(&self.pending_input_preview));
+            flex.push(
+                /*flex*/ 1,
+                RenderableItem::Borrowed(&self.pending_input_preview),
+            );
             if !has_inline_previews && has_status_or_footer {
-                flex.push(0, RenderableItem::Owned("".into()));
+                flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
             }
             let mut flex2 = FlexRenderable::new();
-            flex2.push(1, RenderableItem::Owned(flex.into()));
-            flex2.push(0, RenderableItem::Borrowed(&self.composer));
+            flex2.push(/*flex*/ 1, RenderableItem::Owned(flex.into()));
+            flex2.push(/*flex*/ 0, RenderableItem::Borrowed(&self.composer));
             RenderableItem::Owned(Box::new(flex2))
         }
     }
@@ -1099,6 +1179,16 @@ impl BottomPane {
 
     pub(crate) fn set_status_line_enabled(&mut self, enabled: bool) {
         if self.composer.set_status_line_enabled(enabled) {
+            self.request_redraw();
+        }
+    }
+
+    /// Updates the contextual footer label and requests a redraw only when it changed.
+    ///
+    /// This keeps the footer plumbing cheap during thread transitions where `App` may recompute
+    /// the label several times while the visible thread settles.
+    pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) {
+        if self.composer.set_active_agent_label(active_agent_label) {
             self.request_redraw();
         }
     }
@@ -1594,6 +1684,7 @@ mod tests {
                 dependencies: None,
                 policy: None,
                 permission_profile: None,
+                managed_network_override: None,
                 path_to_skills_md: PathBuf::from("test-skill"),
                 scope: SkillScope::User,
             }]),

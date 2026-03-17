@@ -16,11 +16,22 @@ use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::CollaborationModeListParams;
+use codex_app_server_protocol::CommandExecParams;
+use codex_app_server_protocol::CommandExecResizeParams;
+use codex_app_server_protocol::CommandExecTerminateParams;
+use codex_app_server_protocol::CommandExecWriteParams;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ExperimentalFeatureListParams;
 use codex_app_server_protocol::FeedbackUploadParams;
+use codex_app_server_protocol::FsCopyParams;
+use codex_app_server_protocol::FsCreateDirectoryParams;
+use codex_app_server_protocol::FsGetMetadataParams;
+use codex_app_server_protocol::FsReadDirectoryParams;
+use codex_app_server_protocol::FsReadFileParams;
+use codex_app_server_protocol::FsRemoveParams;
+use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetConversationSummaryParams;
@@ -37,6 +48,8 @@ use codex_app_server_protocol::MockExperimentalMethodParams;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginListParams;
+use codex_app_server_protocol::PluginReadParams;
+use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ServerRequest;
@@ -254,7 +267,8 @@ impl McpProcess {
 
     /// Send an `account/rateLimits/read` JSON-RPC request.
     pub async fn send_get_account_rate_limits_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("account/rateLimits/read", None).await
+        self.send_request("account/rateLimits/read", /*params*/ None)
+            .await
     }
 
     /// Send an `account/read` JSON-RPC request.
@@ -450,6 +464,15 @@ impl McpProcess {
         self.send_request("plugin/install", params).await
     }
 
+    /// Send a `plugin/uninstall` JSON-RPC request.
+    pub async fn send_plugin_uninstall_request(
+        &mut self,
+        params: PluginUninstallParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("plugin/uninstall", params).await
+    }
+
     /// Send a `plugin/list` JSON-RPC request.
     pub async fn send_plugin_list_request(
         &mut self,
@@ -457,6 +480,15 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("plugin/list", params).await
+    }
+
+    /// Send a `plugin/read` JSON-RPC request.
+    pub async fn send_plugin_read_request(
+        &mut self,
+        params: PluginReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("plugin/read", params).await
     }
 
     /// Send a JSON-RPC request with raw params for protocol-level validation tests.
@@ -492,6 +524,42 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("turn/start", params).await
+    }
+
+    /// Send a `command/exec` JSON-RPC request (v2).
+    pub async fn send_command_exec_request(
+        &mut self,
+        params: CommandExecParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("command/exec", params).await
+    }
+
+    /// Send a `command/exec/write` JSON-RPC request (v2).
+    pub async fn send_command_exec_write_request(
+        &mut self,
+        params: CommandExecWriteParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("command/exec/write", params).await
+    }
+
+    /// Send a `command/exec/resize` JSON-RPC request (v2).
+    pub async fn send_command_exec_resize_request(
+        &mut self,
+        params: CommandExecResizeParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("command/exec/resize", params).await
+    }
+
+    /// Send a `command/exec/terminate` JSON-RPC request (v2).
+    pub async fn send_command_exec_terminate_request(
+        &mut self,
+        params: CommandExecTerminateParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("command/exec/terminate", params).await
     }
 
     /// Send a `turn/interrupt` JSON-RPC request (v2).
@@ -544,7 +612,7 @@ impl McpProcess {
     /// Deterministically clean up an intentionally in-flight turn.
     ///
     /// Some tests assert behavior while a turn is still running. Returning from those tests
-    /// without an explicit interrupt + `codex/event/turn_aborted` wait can leave in-flight work
+    /// without an explicit interrupt + terminal turn notification wait can leave in-flight work
     /// racing teardown and intermittently show up as `LEAK` in nextest.
     ///
     /// In rare races, the turn can also fail or complete on its own after we send
@@ -581,18 +649,19 @@ impl McpProcess {
         }
         match tokio::time::timeout(
             read_timeout,
-            self.read_stream_until_notification_message("codex/event/turn_aborted"),
+            self.read_stream_until_notification_message("turn/completed"),
         )
         .await
         {
             Ok(result) => {
-                result.with_context(|| "failed while waiting for turn aborted notification")?;
+                result.with_context(|| "failed while waiting for terminal turn notification")?;
             }
             Err(err) => {
                 if self.pending_turn_completed_notification(&thread_id, &turn_id) {
                     return Ok(());
                 }
-                return Err(err).with_context(|| "timed out waiting for turn aborted notification");
+                return Err(err)
+                    .with_context(|| "timed out waiting for terminal turn notification");
             }
         }
         Ok(())
@@ -648,9 +717,59 @@ impl McpProcess {
         self.send_request("config/batchWrite", params).await
     }
 
+    pub async fn send_fs_read_file_request(
+        &mut self,
+        params: FsReadFileParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/readFile", params).await
+    }
+
+    pub async fn send_fs_write_file_request(
+        &mut self,
+        params: FsWriteFileParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/writeFile", params).await
+    }
+
+    pub async fn send_fs_create_directory_request(
+        &mut self,
+        params: FsCreateDirectoryParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/createDirectory", params).await
+    }
+
+    pub async fn send_fs_get_metadata_request(
+        &mut self,
+        params: FsGetMetadataParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/getMetadata", params).await
+    }
+
+    pub async fn send_fs_read_directory_request(
+        &mut self,
+        params: FsReadDirectoryParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/readDirectory", params).await
+    }
+
+    pub async fn send_fs_remove_request(&mut self, params: FsRemoveParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/remove", params).await
+    }
+
+    pub async fn send_fs_copy_request(&mut self, params: FsCopyParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/copy", params).await
+    }
+
     /// Send an `account/logout` JSON-RPC request.
     pub async fn send_logout_account_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("account/logout", None).await
+        self.send_request("account/logout", /*params*/ None).await
     }
 
     /// Send an `account/login/start` JSON-RPC request for API key login.
@@ -912,6 +1031,31 @@ impl McpProcess {
         Ok(notification)
     }
 
+    pub async fn read_stream_until_matching_notification<F>(
+        &mut self,
+        description: &str,
+        predicate: F,
+    ) -> anyhow::Result<JSONRPCNotification>
+    where
+        F: Fn(&JSONRPCNotification) -> bool,
+    {
+        eprintln!("in read_stream_until_matching_notification({description})");
+
+        let message = self
+            .read_stream_until_message(|message| {
+                matches!(
+                    message,
+                    JSONRPCMessage::Notification(notification) if predicate(notification)
+                )
+            })
+            .await?;
+
+        let JSONRPCMessage::Notification(notification) = message else {
+            unreachable!("expected JSONRPCMessage::Notification, got {message:?}");
+        };
+        Ok(notification)
+    }
+
     pub async fn read_next_message(&mut self) -> anyhow::Result<JSONRPCMessage> {
         self.read_stream_until_message(|_| true).await
     }
@@ -922,6 +1066,16 @@ impl McpProcess {
     /// messages buffered from the prior turn.
     pub fn clear_message_buffer(&mut self) {
         self.pending_messages.clear();
+    }
+
+    pub fn pending_notification_methods(&self) -> Vec<String> {
+        self.pending_messages
+            .iter()
+            .filter_map(|message| match message {
+                JSONRPCMessage::Notification(notification) => Some(notification.method.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Reads the stream until a message matches `predicate`, buffering any non-matching messages
