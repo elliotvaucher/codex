@@ -1,7 +1,7 @@
 //! Tracing helpers shared by socket and in-process app-server entry points.
 //!
 //! The in-process path intentionally reuses the same span shape as JSON-RPC
-//! transports so request telemetry stays comparable across stdio, websocket,
+//! transports so request telemetry stays comparable across stdio, unix socket,
 //! and embedded callers. [`typed_request_span`] is the in-process counterpart
 //! of [`request_span`] and stamps `rpc.transport` as `"in-process"` while
 //! deriving client identity from the typed [`ClientRequest`] rather than
@@ -23,7 +23,7 @@ use tracing::info_span;
 
 pub(crate) fn request_span(
     request: &JSONRPCRequest,
-    transport: AppServerTransport,
+    transport: &AppServerTransport,
     connection_id: ConnectionId,
     session: &ConnectionSessionState,
 ) -> Span {
@@ -72,20 +72,21 @@ pub(crate) fn typed_request_span(
         &span,
         client_info
             .map(|(client_name, _)| client_name)
-            .or(session.app_server_client_name.as_deref()),
+            .or(session.app_server_client_name()),
         client_info
             .map(|(_, client_version)| client_version)
-            .or(session.client_version.as_deref()),
+            .or(session.client_version()),
     );
 
     attach_parent_context(&span, &method, request.id(), /*parent_trace*/ None);
     span
 }
 
-fn transport_name(transport: AppServerTransport) -> &'static str {
+fn transport_name(transport: &AppServerTransport) -> &'static str {
     match transport {
         AppServerTransport::Stdio => "stdio",
-        AppServerTransport::WebSocket { .. } => "websocket",
+        AppServerTransport::UnixSocket { .. } => "unix_socket",
+        AppServerTransport::Off => "off",
     }
 }
 
@@ -107,6 +108,7 @@ fn app_server_request_span_template(
         app_server.api_version = "v2",
         app_server.client_name = field::Empty,
         app_server.client_version = field::Empty,
+        turn.id = field::Empty,
     )
 }
 
@@ -145,7 +147,7 @@ fn client_name<'a>(
     if let Some(params) = initialize_client_info {
         return Some(params.client_info.name.as_str());
     }
-    session.app_server_client_name.as_deref()
+    session.app_server_client_name()
 }
 
 fn client_version<'a>(
@@ -155,7 +157,7 @@ fn client_version<'a>(
     if let Some(params) = initialize_client_info {
         return Some(params.client_info.version.as_str());
     }
-    session.client_version.as_deref()
+    session.client_version()
 }
 
 fn initialize_client_info(request: &JSONRPCRequest) -> Option<InitializeParams> {

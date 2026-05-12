@@ -97,7 +97,7 @@ pub(crate) async fn run_cwd_selection_prompt(
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
                 TuiEvent::Paste(_) => {}
-                TuiEvent::Draw => {
+                TuiEvent::Draw | TuiEvent::Resize => {
                     tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     })?;
@@ -268,7 +268,8 @@ mod tests {
     #[test]
     fn cwd_prompt_snapshot() {
         let screen = new_prompt();
-        let mut terminal = Terminal::new(VT100Backend::new(80, 14)).expect("terminal");
+        let mut terminal =
+            Terminal::new(VT100Backend::new(/*width*/ 80, /*height*/ 14)).expect("terminal");
         terminal
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render cwd prompt");
@@ -283,7 +284,8 @@ mod tests {
             "/Users/example/current".to_string(),
             "/Users/example/session".to_string(),
         );
-        let mut terminal = Terminal::new(VT100Backend::new(80, 14)).expect("terminal");
+        let mut terminal =
+            Terminal::new(VT100Backend::new(/*width*/ 80, /*height*/ 14)).expect("terminal");
         terminal
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render cwd prompt");

@@ -4,10 +4,9 @@ use std::time::Duration;
 
 use codex_protocol::ThreadId;
 use rand::Rng;
-use tracing::debug;
 use tracing::error;
 
-use crate::parse_command::shlex_join;
+use codex_shell_command::parse_command::shlex_join;
 
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
@@ -37,23 +36,6 @@ macro_rules! feedback_tags {
     };
 }
 
-pub(crate) struct FeedbackRequestTags<'a> {
-    pub endpoint: &'a str,
-    pub auth_header_attached: bool,
-    pub auth_header_name: Option<&'a str>,
-    pub auth_mode: Option<&'a str>,
-    pub auth_retry_after_unauthorized: Option<bool>,
-    pub auth_recovery_mode: Option<&'a str>,
-    pub auth_recovery_phase: Option<&'a str>,
-    pub auth_connection_reused: Option<bool>,
-    pub auth_request_id: Option<&'a str>,
-    pub auth_cf_ray: Option<&'a str>,
-    pub auth_error: Option<&'a str>,
-    pub auth_error_code: Option<&'a str>,
-    pub auth_recovery_followup_success: Option<bool>,
-    pub auth_recovery_followup_status: Option<u16>,
-}
-
 struct Auth401FeedbackSnapshot<'a> {
     request_id: &'a str,
     cf_ray: &'a str,
@@ -75,45 +57,6 @@ impl<'a> Auth401FeedbackSnapshot<'a> {
             error_code: error_code.unwrap_or(""),
         }
     }
-}
-
-pub(crate) fn emit_feedback_request_tags(tags: &FeedbackRequestTags<'_>) {
-    let auth_header_name = tags.auth_header_name.unwrap_or("");
-    let auth_mode = tags.auth_mode.unwrap_or("");
-    let auth_retry_after_unauthorized = tags
-        .auth_retry_after_unauthorized
-        .map_or_else(String::new, |value| value.to_string());
-    let auth_recovery_mode = tags.auth_recovery_mode.unwrap_or("");
-    let auth_recovery_phase = tags.auth_recovery_phase.unwrap_or("");
-    let auth_connection_reused = tags
-        .auth_connection_reused
-        .map_or_else(String::new, |value| value.to_string());
-    let auth_request_id = tags.auth_request_id.unwrap_or("");
-    let auth_cf_ray = tags.auth_cf_ray.unwrap_or("");
-    let auth_error = tags.auth_error.unwrap_or("");
-    let auth_error_code = tags.auth_error_code.unwrap_or("");
-    let auth_recovery_followup_success = tags
-        .auth_recovery_followup_success
-        .map_or_else(String::new, |value| value.to_string());
-    let auth_recovery_followup_status = tags
-        .auth_recovery_followup_status
-        .map_or_else(String::new, |value| value.to_string());
-    feedback_tags!(
-        endpoint = tags.endpoint,
-        auth_header_attached = tags.auth_header_attached,
-        auth_header_name = auth_header_name,
-        auth_mode = auth_mode,
-        auth_retry_after_unauthorized = auth_retry_after_unauthorized,
-        auth_recovery_mode = auth_recovery_mode,
-        auth_recovery_phase = auth_recovery_phase,
-        auth_connection_reused = auth_connection_reused,
-        auth_request_id = auth_request_id,
-        auth_cf_ray = auth_cf_ray,
-        auth_error = auth_error,
-        auth_error_code = auth_error_code,
-        auth_recovery_followup_success = auth_recovery_followup_success,
-        auth_recovery_followup_status = auth_recovery_followup_status
-    );
 }
 
 pub(crate) fn emit_feedback_auth_recovery_tags(
@@ -155,21 +98,6 @@ pub(crate) fn error_or_panic(message: impl std::string::ToString) {
     } else {
         error!("{}", message.to_string());
     }
-}
-
-pub(crate) fn try_parse_error_message(text: &str) -> String {
-    debug!("Parsing server error response: {}", text);
-    let json = serde_json::from_str::<serde_json::Value>(text).unwrap_or_default();
-    if let Some(error) = json.get("error")
-        && let Some(message) = error.get("message")
-        && let Some(message_str) = message.as_str()
-    {
-        return message_str.to_string();
-    }
-    if text.is_empty() {
-        return "Unknown error".to_string();
-    }
-    text.to_string()
 }
 
 pub fn resolve_path(base: &Path, path: &PathBuf) -> PathBuf {
